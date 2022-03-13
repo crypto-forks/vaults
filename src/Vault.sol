@@ -20,6 +20,14 @@ contract Vault is ERC20, Auth {
     using FixedPointMathLib for uint256;
 
     /*///////////////////////////////////////////////////////////////
+                                 CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice The maximum number of elements allowed on the withdrawal stack.
+    /// @dev Needed to prevent denial of service attacks by queue operators.
+    uint256 internal constant MAX_WITHDRAWAL_STACK_SIZE = 32;
+
+    /*///////////////////////////////////////////////////////////////
                                 IMMUTABLES
     //////////////////////////////////////////////////////////////*/
 
@@ -28,7 +36,7 @@ contract Vault is ERC20, Auth {
 
     /// @notice The base unit of the underlying token and hence rvToken.
     /// @dev Equal to 10 ** decimals. Used for fixed point arithmetic.
-    uint256 public immutable BASE_UNIT;
+    uint256 internal immutable BASE_UNIT;
 
     /// @notice Creates a new Vault that accepts a specific underlying token.
     /// @param _UNDERLYING The ERC20 compliant token the Vault should accept.
@@ -190,8 +198,8 @@ contract Vault is ERC20, Auth {
     /// @param newUnderlyingIsWETH Whether the Vault should treat the underlying as WETH.
     /// @dev The underlying token must have 18 decimals, to match Ether's decimal scheme.
     function setUnderlyingIsWETH(bool newUnderlyingIsWETH) external requiresAuth {
-        // Ensure the underlying token's decimals match ETH.
-        require(UNDERLYING.decimals() == 18, "WRONG_DECIMALS");
+        // Ensure the underlying token's decimals match ETH if is WETH being set to true.
+        require(!newUnderlyingIsWETH || UNDERLYING.decimals() == 18, "WRONG_DECIMALS");
 
         // Update whether the Vault treats the underlying as WETH.
         underlyingIsWETH = newUnderlyingIsWETH;
@@ -235,21 +243,21 @@ contract Vault is ERC20, Auth {
     uint128 public maxLockedProfit;
 
     /*///////////////////////////////////////////////////////////////
-                        WITHDRAWAL QUEUE STORAGE
+                        WITHDRAWAL STACK STORAGE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice An ordered array of strategies representing the withdrawal queue.
-    /// @dev The queue is processed in descending order, meaning the last index will be withdrawn from first.
+    /// @notice An ordered array of strategies representing the withdrawal stack.
+    /// @dev The stack is processed in descending order, meaning the last index will be withdrawn from first.
     /// @dev Strategies that are untrusted, duplicated, or have no balance are filtered out when encountered at
-    /// withdrawal time, not validated upfront, meaning the queue may not reflect the "true" set used for withdrawals.
-    Strategy[] public withdrawalQueue;
+    /// withdrawal time, not validated upfront, meaning the stack may not reflect the "true" set used for withdrawals.
+    Strategy[] public withdrawalStack;
 
-    /// @notice Gets the full withdrawal queue.
-    /// @return An ordered array of strategies representing the withdrawal queue.
+    /// @notice Gets the full withdrawal stack.
+    /// @return An ordered array of strategies representing the withdrawal stack.
     /// @dev This is provided because Solidity converts public arrays into index getters,
     /// but we need a way to allow external contracts and users to access the whole array.
-    function getWithdrawalQueue() external view returns (Strategy[] memory) {
-        return withdrawalQueue;
+    function getWithdrawalStack() external view returns (Strategy[] memory) {
+        return withdrawalStack;
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -269,11 +277,8 @@ contract Vault is ERC20, Auth {
     /// @notice Deposit a specific amount of underlying tokens.
     /// @param underlyingAmount The amount of the underlying token to deposit.
     function deposit(uint256 underlyingAmount) external {
-        // We don't allow depositing 0 to prevent emitting a useless event.
-        require(underlyingAmount != 0, "AMOUNT_CANNOT_BE_ZERO");
-
         // Determine the equivalent amount of rvTokens and mint them.
-        _mint(msg.sender, underlyingAmount.fdiv(exchangeRate(), BASE_UNIT));
+        _mint(msg.sender, underlyingAmount.mulDivDown(BASE_UNIT, exchangeRate()));
 
         emit Deposit(msg.sender, underlyingAmount);
 
@@ -285,12 +290,9 @@ contract Vault is ERC20, Auth {
     /// @notice Withdraw a specific amount of underlying tokens.
     /// @param underlyingAmount The amount of underlying tokens to withdraw.
     function withdraw(uint256 underlyingAmount) external {
-        // We don't allow withdrawing 0 to prevent emitting a useless event.
-        require(underlyingAmount != 0, "AMOUNT_CANNOT_BE_ZERO");
-
         // Determine the equivalent amount of rvTokens and burn them.
         // This will revert if the user does not have enough rvTokens.
-        _burn(msg.sender, underlyingAmount.fdiv(exchangeRate(), BASE_UNIT));
+        _burn(msg.sender, underlyingAmount.mulDivDown(BASE_UNIT, exchangeRate()));
 
         emit Withdraw(msg.sender, underlyingAmount);
 
@@ -301,11 +303,8 @@ contract Vault is ERC20, Auth {
     /// @notice Redeem a specific amount of rvTokens for underlying tokens.
     /// @param rvTokenAmount The amount of rvTokens to redeem for underlying tokens.
     function redeem(uint256 rvTokenAmount) external {
-        // We don't allow redeeming 0 to prevent emitting a useless event.
-        require(rvTokenAmount != 0, "AMOUNT_CANNOT_BE_ZERO");
-
         // Determine the equivalent amount of underlying tokens.
-        uint256 underlyingAmount = rvTokenAmount.fmul(exchangeRate(), BASE_UNIT);
+        uint256 underlyingAmount = rvTokenAmount.mulDivDown(exchangeRate(), BASE_UNIT);
 
         // Burn the provided amount of rvTokens.
         // This will revert if the user does not have enough rvTokens.
@@ -328,13 +327,13 @@ contract Vault is ERC20, Auth {
         // If the amount is greater than the float, withdraw from strategies.
         if (underlyingAmount > float) {
             // Compute the amount needed to reach our target float percentage.
-            uint256 floatMissingForTarget = (totalHoldings() - underlyingAmount).fmul(targetFloatPercent, 1e18);
+            uint256 floatMissingForTarget = (totalHoldings() - underlyingAmount).mulWadDown(targetFloatPercent);
 
             // Compute the bare minimum amount we need for this withdrawal.
             uint256 floatMissingForWithdrawal = underlyingAmount - float;
 
             // Pull enough to cover the withdrawal and reach our target float percentage.
-            pullFromWithdrawalQueue(floatMissingForWithdrawal + floatMissingForTarget);
+            pullFromWithdrawalStack(floatMissingForWithdrawal + floatMissingForTarget);
         }
 
         // Transfer the provided amount of underlying tokens.
@@ -349,7 +348,7 @@ contract Vault is ERC20, Auth {
     /// @param user The user to get the underlying balance of.
     /// @return The user's Vault balance in underlying tokens.
     function balanceOfUnderlying(address user) external view returns (uint256) {
-        return balanceOf[user].fmul(exchangeRate(), BASE_UNIT);
+        return balanceOf[user].mulDivDown(exchangeRate(), BASE_UNIT);
     }
 
     /// @notice Returns the amount of underlying tokens an rvToken can be redeemed for.
@@ -362,7 +361,7 @@ contract Vault is ERC20, Auth {
         if (rvTokenSupply == 0) return BASE_UNIT;
 
         // Calculate the exchange rate by dividing the total holdings by the rvToken supply.
-        return totalHoldings().fdiv(rvTokenSupply, BASE_UNIT);
+        return totalHoldings().mulDivDown(BASE_UNIT, rvTokenSupply);
     }
 
     /// @notice Calculates the total amount of underlying tokens the Vault holds.
@@ -467,11 +466,11 @@ contract Vault is ERC20, Auth {
         }
 
         // Compute fees as the fee percent multiplied by the profit.
-        uint256 feesAccrued = totalProfitAccrued.fmul(feePercent, 1e18);
+        uint256 feesAccrued = totalProfitAccrued.mulDivDown(feePercent, 1e18);
 
         // If we accrued any fees, mint an equivalent amount of rvTokens.
         // Authorized users can claim the newly minted rvTokens via claimFees.
-        _mint(address(this), feesAccrued.fdiv(exchangeRate(), BASE_UNIT));
+        _mint(address(this), feesAccrued.mulDivDown(BASE_UNIT, exchangeRate()));
 
         // Update max unlocked profit based on any remaining locked profit plus new profit.
         maxLockedProfit = (lockedProfit() + totalProfitAccrued - feesAccrued).safeCastTo128();
@@ -523,9 +522,6 @@ contract Vault is ERC20, Auth {
         // A strategy must be trusted before it can be deposited into.
         require(getStrategyData[strategy].trusted, "UNTRUSTED_STRATEGY");
 
-        // We don't allow depositing 0 to prevent emitting a useless event.
-        require(underlyingAmount != 0, "AMOUNT_CANNOT_BE_ZERO");
-
         // Increase totalStrategyHoldings to account for the deposit.
         totalStrategyHoldings += underlyingAmount;
 
@@ -556,13 +552,10 @@ contract Vault is ERC20, Auth {
     /// @notice Withdraw a specific amount of underlying tokens from a strategy.
     /// @param strategy The strategy to withdraw from.
     /// @param underlyingAmount  The amount of underlying tokens to withdraw.
-    /// @dev Withdrawing from a strategy will not remove it from the withdrawal queue.
+    /// @dev Withdrawing from a strategy will not remove it from the withdrawal stack.
     function withdrawFromStrategy(Strategy strategy, uint256 underlyingAmount) external requiresAuth {
         // A strategy must be trusted before it can be withdrawn from.
         require(getStrategyData[strategy].trusted, "UNTRUSTED_STRATEGY");
-
-        // We don't allow withdrawing 0 to prevent emitting a useless event.
-        require(underlyingAmount != 0, "AMOUNT_CANNOT_BE_ZERO");
 
         // Without this the next harvest would count the withdrawal as a loss.
         getStrategyData[strategy].balance -= underlyingAmount.safeCastTo248();
@@ -622,42 +615,42 @@ contract Vault is ERC20, Auth {
     }
 
     /*///////////////////////////////////////////////////////////////
-                         WITHDRAWAL QUEUE LOGIC
+                         WITHDRAWAL STACK LOGIC
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Emitted when a strategy is pushed to the withdrawal queue.
+    /// @notice Emitted when a strategy is pushed to the withdrawal stack.
     /// @param user The authorized user who triggered the push.
-    /// @param pushedStrategy The strategy pushed to the withdrawal queue.
-    event WithdrawalQueuePushed(address indexed user, Strategy indexed pushedStrategy);
+    /// @param pushedStrategy The strategy pushed to the withdrawal stack.
+    event WithdrawalStackPushed(address indexed user, Strategy indexed pushedStrategy);
 
-    /// @notice Emitted when a strategy is popped from the withdrawal queue.
+    /// @notice Emitted when a strategy is popped from the withdrawal stack.
     /// @param user The authorized user who triggered the pop.
-    /// @param poppedStrategy The strategy popped from the withdrawal queue.
-    event WithdrawalQueuePopped(address indexed user, Strategy indexed poppedStrategy);
+    /// @param poppedStrategy The strategy popped from the withdrawal stack.
+    event WithdrawalStackPopped(address indexed user, Strategy indexed poppedStrategy);
 
-    /// @notice Emitted when the withdrawal queue is updated.
+    /// @notice Emitted when the withdrawal stack is updated.
     /// @param user The authorized user who triggered the set.
-    /// @param replacedWithdrawalQueue The new withdrawal queue.
-    event WithdrawalQueueSet(address indexed user, Strategy[] replacedWithdrawalQueue);
+    /// @param replacedWithdrawalStack The new withdrawal stack.
+    event WithdrawalStackSet(address indexed user, Strategy[] replacedWithdrawalStack);
 
-    /// @notice Emitted when an index in the withdrawal queue is replaced.
+    /// @notice Emitted when an index in the withdrawal stack is replaced.
     /// @param user The authorized user who triggered the replacement.
-    /// @param index The index of the replaced strategy in the withdrawal queue.
-    /// @param replacedStrategy The strategy in the withdrawal queue that was replaced.
+    /// @param index The index of the replaced strategy in the withdrawal stack.
+    /// @param replacedStrategy The strategy in the withdrawal stack that was replaced.
     /// @param replacementStrategy The strategy that overrode the replaced strategy at the index.
-    event WithdrawalQueueIndexReplaced(
+    event WithdrawalStackIndexReplaced(
         address indexed user,
         uint256 index,
         Strategy indexed replacedStrategy,
         Strategy indexed replacementStrategy
     );
 
-    /// @notice Emitted when an index in the withdrawal queue is replaced with the tip.
+    /// @notice Emitted when an index in the withdrawal stack is replaced with the tip.
     /// @param user The authorized user who triggered the replacement.
-    /// @param index The index of the replaced strategy in the withdrawal queue.
-    /// @param replacedStrategy The strategy in the withdrawal queue replaced by the tip.
-    /// @param previousTipStrategy The previous tip of the queue that replaced the strategy.
-    event WithdrawalQueueIndexReplacedWithTip(
+    /// @param index The index of the replaced strategy in the withdrawal stack.
+    /// @param replacedStrategy The strategy in the withdrawal stack replaced by the tip.
+    /// @param previousTipStrategy The previous tip of the stack that replaced the strategy.
+    event WithdrawalStackIndexReplacedWithTip(
         address indexed user,
         uint256 index,
         Strategy indexed replacedStrategy,
@@ -670,7 +663,7 @@ contract Vault is ERC20, Auth {
     /// @param index2 The other index involved in the swap.
     /// @param newStrategy1 The strategy (previously at index2) that replaced index1.
     /// @param newStrategy2 The strategy (previously at index1) that replaced index2.
-    event WithdrawalQueueIndexesSwapped(
+    event WithdrawalStackIndexesSwapped(
         address indexed user,
         uint256 index1,
         uint256 index2,
@@ -678,38 +671,38 @@ contract Vault is ERC20, Auth {
         Strategy indexed newStrategy2
     );
 
-    /// @dev Withdraw a specific amount of underlying tokens from strategies in the withdrawal queue.
+    /// @dev Withdraw a specific amount of underlying tokens from strategies in the withdrawal stack.
     /// @param underlyingAmount The amount of underlying tokens to pull into float.
-    /// @dev Automatically removes depleted strategies from the withdrawal queue.
-    function pullFromWithdrawalQueue(uint256 underlyingAmount) internal {
+    /// @dev Automatically removes depleted strategies from the withdrawal stack.
+    function pullFromWithdrawalStack(uint256 underlyingAmount) internal {
         // We will update this variable as we pull from strategies.
         uint256 amountLeftToPull = underlyingAmount;
 
-        // We'll start at the tip of the queue and traverse backwards.
-        uint256 currentIndex = withdrawalQueue.length - 1;
+        // We'll start at the tip of the stack and traverse backwards.
+        uint256 currentIndex = withdrawalStack.length - 1;
 
-        // Iterate in reverse so we pull from the queue in a "last in, first out" manner.
-        // Will revert due to underflow if we empty the queue before pulling the desired amount.
+        // Iterate in reverse so we pull from the stack in a "last in, first out" manner.
+        // Will revert due to underflow if we empty the stack before pulling the desired amount.
         for (; ; currentIndex--) {
-            // Get the strategy at the current queue index.
-            Strategy strategy = withdrawalQueue[currentIndex];
+            // Get the strategy at the current stack index.
+            Strategy strategy = withdrawalStack[currentIndex];
 
             // Get the balance of the strategy before we withdraw from it.
             uint256 strategyBalance = getStrategyData[strategy].balance;
 
             // If the strategy is currently untrusted or was already depleted:
             if (!getStrategyData[strategy].trusted || strategyBalance == 0) {
-                // Remove it from the queue.
-                withdrawalQueue.pop();
+                // Remove it from the stack.
+                withdrawalStack.pop();
 
-                emit WithdrawalQueuePopped(msg.sender, strategy);
+                emit WithdrawalStackPopped(msg.sender, strategy);
 
                 // Move onto the next strategy.
                 continue;
             }
 
             // We want to pull as much as we can from the strategy, but no more than we need.
-            uint256 amountToPull = FixedPointMathLib.min(amountLeftToPull, strategyBalance);
+            uint256 amountToPull = strategyBalance > amountLeftToPull ? amountLeftToPull : strategyBalance;
 
             unchecked {
                 // Compute the balance of the strategy that will remain after we withdraw.
@@ -730,10 +723,10 @@ contract Vault is ERC20, Auth {
 
                 // If we fully depleted the strategy:
                 if (strategyBalanceAfterWithdrawal == 0) {
-                    // Remove it from the queue.
-                    withdrawalQueue.pop();
+                    // Remove it from the stack.
+                    withdrawalStack.pop();
 
-                    emit WithdrawalQueuePopped(msg.sender, strategy);
+                    emit WithdrawalStackPopped(msg.sender, strategy);
                 }
             }
 
@@ -754,85 +747,91 @@ contract Vault is ERC20, Auth {
         if (ethBalance != 0 && underlyingIsWETH) WETH(payable(address(UNDERLYING))).deposit{value: ethBalance}();
     }
 
-    /// @notice Pushes a single strategy to front of the withdrawal queue.
-    /// @param strategy The strategy to be inserted at the front of the withdrawal queue.
+    /// @notice Pushes a single strategy to front of the withdrawal stack.
+    /// @param strategy The strategy to be inserted at the front of the withdrawal stack.
     /// @dev Strategies that are untrusted, duplicated, or have no balance are
     /// filtered out when encountered at withdrawal time, not validated upfront.
-    function pushToWithdrawalQueue(Strategy strategy) external requiresAuth {
-        // Push the strategy to the front of the queue.
-        withdrawalQueue.push(strategy);
+    function pushToWithdrawalStack(Strategy strategy) external requiresAuth {
+        // Ensure pushing the strategy will not cause the stack exceed its limit.
+        require(withdrawalStack.length < MAX_WITHDRAWAL_STACK_SIZE, "STACK_FULL");
 
-        emit WithdrawalQueuePushed(msg.sender, strategy);
+        // Push the strategy to the front of the stack.
+        withdrawalStack.push(strategy);
+
+        emit WithdrawalStackPushed(msg.sender, strategy);
     }
 
-    /// @notice Removes the strategy at the tip of the withdrawal queue.
+    /// @notice Removes the strategy at the tip of the withdrawal stack.
     /// @dev Be careful, another authorized user could push a different strategy
-    /// than expected to the queue while a popFromWithdrawalQueue transaction is pending.
-    function popFromWithdrawalQueue() external requiresAuth {
+    /// than expected to the stack while a popFromWithdrawalStack transaction is pending.
+    function popFromWithdrawalStack() external requiresAuth {
         // Get the (soon to be) popped strategy.
-        Strategy poppedStrategy = withdrawalQueue[withdrawalQueue.length - 1];
+        Strategy poppedStrategy = withdrawalStack[withdrawalStack.length - 1];
 
-        // Pop the first strategy in the queue.
-        withdrawalQueue.pop();
+        // Pop the first strategy in the stack.
+        withdrawalStack.pop();
 
-        emit WithdrawalQueuePopped(msg.sender, poppedStrategy);
+        emit WithdrawalStackPopped(msg.sender, poppedStrategy);
     }
 
-    /// @notice Sets a new withdrawal queue.
-    /// @param newQueue The new withdrawal queue.
+    /// @notice Sets a new withdrawal stack.
+    /// @param newStack The new withdrawal stack.
     /// @dev Strategies that are untrusted, duplicated, or have no balance are
     /// filtered out when encountered at withdrawal time, not validated upfront.
-    function setWithdrawalQueue(Strategy[] calldata newQueue) external requiresAuth {
-        // Replace the withdrawal queue.
-        withdrawalQueue = newQueue;
+    function setWithdrawalStack(Strategy[] calldata newStack) external requiresAuth {
+        // Ensure the new stack is not larger than the maximum stack size.
+        require(newStack.length <= MAX_WITHDRAWAL_STACK_SIZE, "STACK_TOO_BIG");
 
-        emit WithdrawalQueueSet(msg.sender, newQueue);
+        // Replace the withdrawal stack.
+        withdrawalStack = newStack;
+
+        emit WithdrawalStackSet(msg.sender, newStack);
     }
 
-    /// @notice Replaces an index in the withdrawal queue with another strategy.
-    /// @param index The index in the queue to replace.
+    /// @notice Replaces an index in the withdrawal stack with another strategy.
+    /// @param index The index in the stack to replace.
     /// @param replacementStrategy The strategy to override the index with.
     /// @dev Strategies that are untrusted, duplicated, or have no balance are
     /// filtered out when encountered at withdrawal time, not validated upfront.
-    function replaceWithdrawalQueueIndex(uint256 index, Strategy replacementStrategy) external requiresAuth {
+    function replaceWithdrawalStackIndex(uint256 index, Strategy replacementStrategy) external requiresAuth {
         // Get the (soon to be) replaced strategy.
-        Strategy replacedStrategy = withdrawalQueue[index];
+        Strategy replacedStrategy = withdrawalStack[index];
 
         // Update the index with the replacement strategy.
-        withdrawalQueue[index] = replacementStrategy;
+        withdrawalStack[index] = replacementStrategy;
 
-        emit WithdrawalQueueIndexReplaced(msg.sender, index, replacedStrategy, replacementStrategy);
+        emit WithdrawalStackIndexReplaced(msg.sender, index, replacedStrategy, replacementStrategy);
     }
 
-    /// @notice Moves the strategy at the tip of the queue to the specified index and pop the tip off the queue.
-    /// @param index The index of the strategy in the withdrawal queue to replace with the tip.
-    function replaceWithdrawalQueueIndexWithTip(uint256 index) external requiresAuth {
+    /// @notice Moves the strategy at the tip of the stack to the specified index and pop the tip off the stack.
+    /// @param index The index of the strategy in the withdrawal stack to replace with the tip.
+    function replaceWithdrawalStackIndexWithTip(uint256 index) external requiresAuth {
         // Get the (soon to be) previous tip and strategy we will replace at the index.
-        Strategy previousTipStrategy = withdrawalQueue[withdrawalQueue.length - 1];
-        Strategy replacedStrategy = withdrawalQueue[index];
+        Strategy previousTipStrategy = withdrawalStack[withdrawalStack.length - 1];
+        Strategy replacedStrategy = withdrawalStack[index];
 
-        // Replace the index specified with the tip of the queue.
-        withdrawalQueue[index] = previousTipStrategy;
+        // Replace the index specified with the tip of the stack.
+        withdrawalStack[index] = previousTipStrategy;
 
         // Remove the now duplicated tip from the array.
-        withdrawalQueue.pop();
+        withdrawalStack.pop();
 
-        emit WithdrawalQueueIndexReplacedWithTip(msg.sender, index, replacedStrategy, previousTipStrategy);
+        emit WithdrawalStackIndexReplacedWithTip(msg.sender, index, replacedStrategy, previousTipStrategy);
     }
 
-    /// @notice Swaps two indexes in the withdrawal queue.
+    /// @notice Swaps two indexes in the withdrawal stack.
     /// @param index1 One index involved in the swap
     /// @param index2 The other index involved in the swap.
-    function swapWithdrawalQueueIndexes(uint256 index1, uint256 index2) external requiresAuth {
+    function swapWithdrawalStackIndexes(uint256 index1, uint256 index2) external requiresAuth {
         // Get the (soon to be) new strategies at each index.
-        Strategy newStrategy2 = withdrawalQueue[index1];
-        Strategy newStrategy1 = withdrawalQueue[index2];
+        Strategy newStrategy2 = withdrawalStack[index1];
+        Strategy newStrategy1 = withdrawalStack[index2];
 
         // Swap the strategies at both indexes.
-        withdrawalQueue[index1] = newStrategy1;
-        withdrawalQueue[index2] = newStrategy2;
+        withdrawalStack[index1] = newStrategy1;
+        withdrawalStack[index2] = newStrategy2;
 
-        emit WithdrawalQueueIndexesSwapped(msg.sender, index1, index2, newStrategy1, newStrategy2);
+        emit WithdrawalStackIndexesSwapped(msg.sender, index1, index2, newStrategy1, newStrategy2);
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -849,9 +848,6 @@ contract Vault is ERC20, Auth {
     /// @dev Intended for use in emergencies or other extraneous situations where the
     /// strategy requires interaction outside of the Vault's standard operating procedures.
     function seizeStrategy(Strategy strategy) external requiresAuth {
-        // A strategy must be trusted before it can be seized.
-        require(getStrategyData[strategy].trusted, "UNTRUSTED_STRATEGY");
-
         // Get the strategy's last reported balance of underlying tokens.
         uint256 strategyBalance = getStrategyData[strategy].balance;
 
